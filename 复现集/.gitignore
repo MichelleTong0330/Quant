@@ -1,0 +1,6 @@
+*.png
+.DS_Store
+*.png          # 忽略所有 png 图片
+黄金律结果/ 
+data_cache/
+data_cache_residual/
