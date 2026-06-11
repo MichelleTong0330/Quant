@@ -37,8 +37,8 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings('ignore')
-random.seed(42)
-np.random.seed(42)
+random.seed(42) # 随机选股做回测
+np.random.seed(42) # 同上
 
 # 中文字体（macOS: PingFang SC；Linux/Windows: SimHei 作后备）
 matplotlib.rcParams['font.sans-serif'] = [

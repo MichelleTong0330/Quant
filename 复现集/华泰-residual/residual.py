@@ -9,6 +9,10 @@ from sklearn.linear_model import LinearRegression
 
 warnings.filterwarnings("ignore")
 
+# 修复 macOS 下 matplotlib 中文乱码
+plt.rcParams["font.family"] = ["Heiti TC", "STHeiti", "Arial Unicode MS", "sans-serif"]
+plt.rcParams["axes.unicode_minus"] = False
+
 # 配置区
 MOM_WINDOW = 12
 START_DATE = "20070101"
@@ -176,62 +180,56 @@ def build_commodity_mom(comm_data: pd.DataFrame) -> pd.DataFrame:
     comm_mom = np.log(1 + comm_mom)
     return comm_mom.dropna(how="all")
 
-# def rolling_pca_factors(data: pd.DataFrame, all_mom, window: int, n_components: int) -> pd.DataFrame:
-#     factor ={}
-#     for i in range(window, len(data)+1):
-#         window_data = data.iloc[i-window:i].dropna(how="all").fillna(0)
-#         pca = PCA(n_components=n_components)
-#         pca.fit(window_data)
-#         factor_values = pca.components_ @ all_mom.iloc[i-1].values
-#         factor[data.index[i-1]] = factor_values
-#     factor_df = pd.DataFrame(factor).T
-#     return factor_df
-
-def rolling_pca_factors(stock_yoy, bond_yoy, comm_yoy, window: int) -> pd.DataFrame:
-    # 三类同比序列对齐
-    idx = stock_yoy.index.intersection(bond_yoy.index).intersection(comm_yoy.index)
-    stock_yoy = stock_yoy.loc[idx]
-    bond_yoy  = bond_yoy.loc[idx]
-    comm_yoy  = comm_yoy.loc[idx]
-
-    factor = {}
-    for i in range(window, len(idx) + 1):
-        t     = idx[i - 1]
-        s_raw = stock_yoy.iloc[i - window: i].fillna(0).values
-        b_raw = bond_yoy.iloc[i - window: i].fillna(0).values
-        c_raw = comm_yoy.iloc[i - window: i].fillna(0).values
-
-        # 每类资产分别做PCA，得到窗口内因子的同比序列
-        F_s = s_raw @ PCA(n_components=3).fit(s_raw).components_.T  # (100, 3)
-        F_b = b_raw @ PCA(n_components=2).fit(b_raw).components_.T  # (100, 2)
-        F_c = c_raw @ PCA(n_components=2).fit(c_raw).components_.T  # (100, 2)
-
-        # 拼成(100, 7)，取最后两行做diff得到当期月频环比因子值
-        F_all = np.hstack([F_s, F_b, F_c])          # (100, 7)
-        factor[t] = F_all[-1] - F_all[-2]           # 当期环比 = 最后一行 - 倒数第二行
-
-    factor_df = pd.DataFrame(factor).T
-    factor_df.index.name = "date"
-    return factor_df
-
-def rolling_ols_residuals(factor_df, stock_mom, window):
-    # 确保日期对齐
-    common_dates = factor_df.index.intersection(stock_mom.index)
-    factor_df = factor_df.loc[common_dates]
-    stock_mom = stock_mom.loc[common_dates]
+# 研报做法：PCA 和 OLS 在同一个 100 月滚动窗口内完成
+# 关键：用 yoy 数据的 PCA loadings，乘以各资产的月频 mom 序列，得到因子的月度环比值
+# 而不是对 yoy 因子序列做 diff（diff 多减了一个 12 期历史项，是错的）
+def rolling_residuals(stock_yoy, bond_yoy, comm_yoy,
+                      stock_mom, bond_mom, comm_mom, window: int) -> pd.DataFrame:
+    idx = (stock_yoy.index
+           .intersection(bond_yoy.index)
+           .intersection(comm_yoy.index)
+           .intersection(stock_mom.index)
+           .intersection(bond_mom.index)
+           .intersection(comm_mom.index))
+    sy = stock_yoy.loc[idx]; by = bond_yoy.loc[idx]; cy = comm_yoy.loc[idx]
+    sm = stock_mom.loc[idx]; bm = bond_mom.loc[idx]; cm = comm_mom.loc[idx]
 
     residuals = {}
-    for i in range(window, len(factor_df)+1):
-        t = common_dates[i-1]
-        X = factor_df.iloc[i-window:i].fillna(0).values
-        y = stock_mom.iloc[i-window:i].fillna(0).values
-        model = LinearRegression().fit(X, y)
-        pred = model.predict(X)
-        resid = (y - pred)[-1] # 取最后一个月的残差
-        residuals[t] = resid
-    residuals_df = pd.DataFrame(residuals, index=stock_mom.columns).T
-    residuals_df.index.name = "date"
-    return residuals_df
+    for i in range(window, len(idx) + 1):
+        t = idx[i - 1]
+        # yoy 数据：用来做 PCA，得到因子方向（loadings）
+        s_raw = sy.iloc[i - window: i].fillna(0).values   # (window, n_stocks)
+        b_raw = by.iloc[i - window: i].fillna(0).values   # (window, 4)
+        c_raw = cy.iloc[i - window: i].fillna(0).values   # (window, 9)
+
+        # 研报国内版：股债商各提3/3/2个主成分
+        pca_s = PCA(n_components=3).fit(s_raw)
+        pca_b = PCA(n_components=3).fit(b_raw)  # 债券提3个，PC1市场+PC2/PC3风格
+        pca_c = PCA(n_components=2).fit(c_raw)
+
+        # mom 数据：用 yoy 的 PCA loadings 做加权求和，得到因子的月度环比序列
+        sm_w = sm.iloc[i - window: i].fillna(0).values    # (window, n_stocks)
+        bm_w = bm.iloc[i - window: i].fillna(0).values    # (window, 4)
+        cm_w = cm.iloc[i - window: i].fillna(0).values    # (window, 9)
+
+        F_s = sm_w @ pca_s.components_.T   # (window, 3)
+        F_b = bm_w @ pca_b.components_.T   # (window, 3)
+        F_c = cm_w @ pca_c.components_.T   # (window, 2)
+
+        # 研报做法：三类 PC1 合并为一个市场因子 X1（简单相加）
+        # 剩余风格因子各自独立：股 PC2/PC3，债 PC2/PC3，商 PC2 → 共 6 个 X
+        market = F_s[:, 0:1] + F_b[:, 0:1] + F_c[:, 0:1]          # (window, 1)
+        style  = np.hstack([F_s[:, 1:], F_b[:, 1:], F_c[:, 1:]])   # (window, 5)
+        F_all  = np.hstack([market, style])                          # (window, 6)
+
+        # OLS：各行业月收益率 ~ 6个共同因子，取最后一个月的残差
+        model = LinearRegression().fit(F_all, sm_w)
+        resid = sm_w - model.predict(F_all)
+        residuals[t] = resid[-1]
+
+    res_df = pd.DataFrame(residuals, index=sm.columns).T
+    res_df.index.name = "date"
+    return res_df
 
 def calc_improved_momentum(residuals_df, lookback=12):
     scores = {}
@@ -241,8 +239,8 @@ def calc_improved_momentum(residuals_df, lookback=12):
         vol = window_resid.std(axis=1)
         high_vol_mom = vol.idxmax()
         adjusted = window_resid.copy()
-        adjusted.loc[high_vol_mom] *= -1        
-        scores[t]    = window_resid.sum(axis=0)
+        adjusted.loc[high_vol_mom] *= -1
+        scores[t]    = adjusted.sum(axis=0)   # 用反转后的序列求和
     score_df = pd.DataFrame(scores).T
     score_df.index.name = "date"
     return score_df
@@ -252,9 +250,10 @@ def backet(scores, stock_mom, top_n= TOP_N):
     portfolio_returns = []
     date = []
     for i in range(len(scores)-1):
-        date.append(scores.index[i])
+        t_next = scores.index[i+1]
+        date.append(t_next)  # 用持仓结束日，使 portfolio_returns 和 benchmark 对齐同一月
         top_stocks = scores.iloc[i].nlargest(top_n).index
-        ret = stock_mom.loc[scores.index[i+1], top_stocks].mean()
+        ret = stock_mom.loc[t_next, top_stocks].mean()
         portfolio_returns.append(ret)
     return pd.Series(portfolio_returns, index=date)
 
@@ -275,40 +274,36 @@ print(all_mom.shape)
 print(bond_mom.columns.tolist())
 
 
-factor_df = rolling_pca_factors(stock_yoy, bond_yoy, comm_yoy, PCA_WINDOW)
 print(f"stock_yoy: {stock_yoy.shape}")
 print(f"bond_yoy: {bond_yoy.shape}")
 print(f"comm_yoy: {comm_yoy.shape}")
-print(f"factor_df: {factor_df.shape}")
-print(f"factor_df时间范围: {factor_df.index[0]} ~ {factor_df.index[-1]}")
-stock_mom = stock_mom.loc[factor_df.index]
-residuals_df = rolling_ols_residuals(factor_df, stock_mom, PCA_WINDOW)
+print("开始滚动 PCA+OLS，约需几分钟...")
+residuals_df = rolling_residuals(stock_yoy, bond_yoy, comm_yoy,
+                                  stock_mom, bond_mom, comm_mom, PCA_WINDOW)
+print(f"residuals_df: {residuals_df.shape}")
+print(f"残差时间范围: {residuals_df.index[0]} ~ {residuals_df.index[-1]}")
 scores = calc_improved_momentum(residuals_df)
 portfolio_returns = backet(scores, stock_mom, TOP_N)
-print(factor_df.index[:3])
-print(stock_mom.index[:3])
+print(f"scores 时间范围: {scores.index[0]} ~ {scores.index[-1]}")
 
 
 
 
 
-nav = (1 + portfolio_returns).cumprod()
-benchmark = stock_mom.mean(axis=1)
-bench_nav = (1 + benchmark).cumprod()
-common_index = nav.index.intersection(bench_nav.index)
+print(f"portfolio_returns 时间范围: {portfolio_returns.index[0]} ~ {portfolio_returns.index[-1]}")
 
-start = "2016-04-30"
+# 用实际数据起点，终点截到 2023-12-31
+start = portfolio_returns.index[0].strftime("%Y-%m-%d")
 end = "2023-12-31"
 port_trimmed = portfolio_returns.loc[start:end]
+benchmark = stock_mom.mean(axis=1)
 bench_trimmed = benchmark.loc[start:end]
 
 common = port_trimmed.index.intersection(bench_trimmed.index)
 port_trimmed = port_trimmed.loc[common]
 bench_trimmed = bench_trimmed.loc[common]
 
-print(f"port_trimmed 长度: {len(port_trimmed)}")
-print(f"portfolio_returns 时间范围: {portfolio_returns.index[0]} ~ {portfolio_returns.index[-1]}")
-print(f"scores 时间范围: {scores.index[0]} ~ {scores.index[-1]}")
+print(f"回测区间: {port_trimmed.index[0].date()} ~ {port_trimmed.index[-1].date()}，共 {len(port_trimmed)} 个月")
 
 nav_trimmed = (1 + port_trimmed).cumprod()
 bench_nav_trimmed = (1 + bench_trimmed).cumprod()
@@ -332,7 +327,77 @@ sharpe = (port_trimmed.mean() * 12) / (port_trimmed.std() * np.sqrt(12))
 print(f"夏普比率: {sharpe:.2f}")
 print(f"月度胜率: {win_rate:.2%}")
 
-plt.plot(nav[common_index], label="改进残差动量")
-plt.plot(bench_nav[common_index], label="等权基准")
-plt.legend()
+# ── 图1：净值曲线 ──────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(nav_trimmed / nav_trimmed.iloc[0], label="改进残差动量（复现）")
+ax.plot(bench_nav_trimmed / bench_nav_trimmed.iloc[0], label="等权基准（复现）")
+ax.set_title("改进残差动量行业轮转 vs 等权基准")
+ax.set_ylabel("累计净值（归一化）")
+ax.legend()
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+fig.savefig(f"{RESULT_DIR}/residual_momentum.png", dpi=150)
+print(f"净值图已保存至 {RESULT_DIR}/residual_momentum.png")
+plt.show()
+
+# ── 图2：与研报数据对比图 ────────────────────────────────────
+# 研报（华泰金工 2024-02）国内行业轮动·改进残差动量
+# 披露数据：回测区间 2016-04-30~2023-12-31，年化超额收益 12.80%
+excess_return = annual_return - bench_annual
+bench_sharpe  = (bench_trimmed.mean() * 12) / (bench_trimmed.std() * np.sqrt(12))
+
+# 研报仅明确披露了这几个数字，其余标 NaN
+paper = {
+    "年化超额收益(%)":  12.80,
+    "策略年化收益(%)":  np.nan,   # 研报未直接给出绝对值
+    "基准年化收益(%)":  np.nan,
+    "策略夏普":         np.nan,
+    "基准夏普":         np.nan,
+}
+ours = {
+    "年化超额收益(%)":  excess_return * 100,
+    "策略年化收益(%)":  annual_return * 100,
+    "基准年化收益(%)":  bench_annual  * 100,
+    "策略夏普":         sharpe,
+    "基准夏普":         bench_sharpe,
+}
+
+labels = list(ours.keys())
+x      = np.arange(len(labels))
+width  = 0.35
+
+fig2, ax2 = plt.subplots(figsize=(11, 6))
+bars_o = ax2.bar(x - width/2,
+                 [ours[k] for k in labels],
+                 width, label="本次复现", color="#4C72B0", alpha=0.85)
+bars_p = ax2.bar(x + width/2,
+                 [paper[k] for k in labels],
+                 width, label="研报披露", color="#DD8452", alpha=0.85)
+
+for bar in bars_o:
+    h = bar.get_height()
+    if not np.isnan(h):
+        ax2.text(bar.get_x() + bar.get_width()/2,
+                 h + (0.2 if h >= 0 else -0.5),
+                 f"{h:.2f}", ha="center", va="bottom", fontsize=8.5, color="#2c5f9e")
+
+for bar in bars_p:
+    h = bar.get_height()
+    if not np.isnan(h):
+        ax2.text(bar.get_x() + bar.get_width()/2,
+                 h + (0.2 if h >= 0 else -0.5),
+                 f"{h:.2f}", ha="center", va="bottom", fontsize=8.5, color="#9b4e1a")
+
+ax2.set_xticks(x)
+ax2.set_xticklabels(labels)
+ax2.axhline(0, color="black", linewidth=0.8, linestyle="--")
+ax2.set_ylabel("数值（收益率单位：%，夏普无量纲）")
+ax2.set_title("复现结果 vs 研报披露数据\n"
+              "（华泰金工2024-02·国内行业轮动·改进残差动量）\n"
+              "注：研报仅披露年化超额收益12.80%，其他研报格空白为正常")
+ax2.legend()
+ax2.grid(True, axis="y", alpha=0.3)
+fig2.tight_layout()
+fig2.savefig(f"{RESULT_DIR}/comparison_with_paper.png", dpi=150)
+print(f"对比图已保存至 {RESULT_DIR}/comparison_with_paper.png")
 plt.show()
