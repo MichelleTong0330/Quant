@@ -427,16 +427,49 @@ def load_local_data(start_date: str, end_date: str,
 MA_PERIODS    = [1, 5, 10, 20, 60, 120]
 MAX_MA_PERIOD = max(MA_PERIODS)   # MA120 预热期长度，前 119 行因子不完整
 
+MA_PERIODS = [1, 5, 10, 20, 60, 120]
+
+# ============================================================
+# 量纲处理方式（可选）
+# 'absolute'：研报原始公式，std(MAs) 为绝对离散度——存在量纲差异
+# 'relative'：真正去量纲——用变异系数 CV = std(MAs)/mean(MAs)
+#             代替绝对 std，使不同价格/成交量/成交额水平的股票
+#             "相对收敛程度"直接可比
+#
+# 注意：这不是统计上的截面标准化（z-score），而是修改了因子
+# 定义本身——会真正改变截面排序、真正改变 RankIC 结果（不是
+# <1% 的噪声级别变化）。这相当于在研报因子基础上构造了一个
+# "相对收敛因子"变体，不再是对研报原始因子的复现。
+#
+# 切换方式：改这一行即可，calc_all_factors 不需要改动
+# ============================================================
+DISPERSION_MODE = 'relative'  # 改成 'relative' 即可启用真正去量纲版本
+
 
 def calc_convergence_factor(series: pd.Series,
-                             periods: list = MA_PERIODS) -> pd.Series:
-    """计算单只股票的收敛因子（适用于价格/成交量/成交额/换手率）。"""
+                             periods: list = MA_PERIODS,
+                             mode: str = None) -> pd.Series:
+    """计算单只股票的收敛因子（适用于价格/成交量/成交额/换手率）。
+
+    mode='absolute'：std(MAs)，研报原始公式
+    mode='relative'：std(MAs)/mean(MAs)（变异系数 CV），真正去量纲
+    """
+    if mode is None:
+        mode = DISPERSION_MODE
+
     mas = pd.DataFrame({
         f'ma{p}': series.rolling(p, min_periods=p).mean()
         for p in periods
     })
-    std = mas.std(axis=1)
-    return -np.log(1 + std)
+
+    if mode == 'relative':
+        dispersion = mas.std(axis=1) / (mas.mean(axis=1) + 1e-8)
+    else:
+        dispersion = mas.std(axis=1)
+
+    return -np.log(1 + dispersion)
+
+
 
 
 def calc_all_factors(df: pd.DataFrame) -> pd.DataFrame:
@@ -466,6 +499,30 @@ def calc_pvcf(panel_df: pd.DataFrame) -> pd.DataFrame:
         )
 
     panel_df['PVCF'] = cross_zscore('PCF') + cross_zscore('VCF')
+    return panel_df
+
+def standardize_factors(panel_df: pd.DataFrame, factor_cols: list) -> pd.DataFrame:
+    """
+    对指定因子做截面 z-score 标准化，去除不同个股之间的量纲差异。
+
+    逻辑与 calc_pvcf 中的 cross_zscore 完全一致：
+    同一日期下，对所有股票的该因子值做 (x - mean) / (std + eps)。
+
+    研报原文（PCF 部分）："且在因子构建时未剔除截面上不同个股价格
+    数值的量纲差异。"——即 PCF / VCF / ACF / TRCF 默认都不做这一步。
+    本函数提供一个可选的去量纲版本，用于对比测试其对 RankIC 的影响。
+
+    注意：
+    - 对 TRCF 而言，换手率本身已是比率（已无量纲），做 z-score
+      只是单调变换，不会改变其 RankIC / 分组回测结果。
+    - 对 PCF / VCF / ACF 而言，z-score 会把"个股自身价格/成交量/
+      成交额绝对水平"这部分信息剔除，只保留截面相对位置信息。
+    """
+    panel_df = panel_df.copy()
+    for col in factor_cols:
+        panel_df[col] = panel_df.groupby('date')[col].transform(
+            lambda x: (x - x.mean()) / (x.std() + 1e-8)
+        )
     return panel_df
 
 
@@ -846,6 +903,15 @@ def main():
 
     # PVCF：面板级别截面 z-score 后合成
     panel_df = calc_pvcf(panel_df)
+
+    # ── 截面去量纲（可选）────────────────────────────────────
+    # 对 PCF / VCF / ACF / TRCF 做截面 z-score，消除不同个股价格/
+    # 成交量/成交额绝对水平不同带来的量纲差异。
+    # 还原研报原始处理方式（不去量纲）：注释掉下面这一行即可。
+   # panel_df = standardize_factors(panel_df, ['VCF', 'ACF', 'TRCF'])
+
+    # 挂载行业标签 & 估算流通市值
+    panel_df['industry'] = panel_df['symbol'].map(industry_map)
 
     # Winsorize：截面 ±3σ 截断，去除极端异常值（异常成交额/换手率数据）
     all_factor_cols = ['PCF', 'VCF', 'PVCF', 'ACF', 'TRCF']
