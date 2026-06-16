@@ -427,44 +427,50 @@ def load_local_data(start_date: str, end_date: str,
 MA_PERIODS    = [1, 5, 10, 20, 60, 120]
 MAX_MA_PERIOD = max(MA_PERIODS)   # MA120 预热期长度，前 119 行因子不完整
 
-MA_PERIODS = [1, 5, 10, 20, 60, 120]
-
 # ============================================================
 # 量纲处理方式（可选）
-# 'absolute'：研报原始公式，std(MAs) 为绝对离散度——存在量纲差异
-# 'relative'：真正去量纲——用变异系数 CV = std(MAs)/mean(MAs)
-#             代替绝对 std，使不同价格/成交量/成交额水平的股票
-#             "相对收敛程度"直接可比
-#
-# 注意：这不是统计上的截面标准化（z-score），而是修改了因子
-# 定义本身——会真正改变截面排序、真正改变 RankIC 结果（不是
-# <1% 的噪声级别变化）。这相当于在研报因子基础上构造了一个
-# "相对收敛因子"变体，不再是对研报原始因子的复现。
-#
-# 切换方式：改这一行即可，calc_all_factors 不需要改动
-# ============================================================
-DISPERSION_MODE = 'relative'  # 改成 'relative' 即可启用真正去量纲版本
+# 'absolute' ：研报原始公式，std(MAs) 为绝对离散度——存在量纲差异
+# 'relative' ：变异系数 CV = std(MAs)/mean(MAs)，真正去量纲
+# 'log_return'：先把价格序列转为对数收益率，再算均线和 std
+#               只对 PCF 有经济意义；VCF/ACF/TRCF 不建议使用
+#               （成交量/成交额的"变化率"没有对应的金融含义，
+#                且分布极度厚尾、噪声远大于价格收益率）
 
 
 def calc_convergence_factor(series: pd.Series,
                              periods: list = MA_PERIODS,
                              mode: str = None) -> pd.Series:
-    """计算单只股票的收敛因子（适用于价格/成交量/成交额/换手率）。
+    """计算单只股票的收敛因子。
 
-    mode='absolute'：std(MAs)，研报原始公式
-    mode='relative'：std(MAs)/mean(MAs)（变异系数 CV），真正去量纲
+    mode='absolute'  ：std(MAs)，研报原始公式
+    mode='relative'  ：std(MAs)/mean(MAs)（变异系数 CV），真正去量纲
+    mode='log_return'：先把原始序列转为对数收益率，再算均线和 std。
+                       去量纲逻辑：对数收益率本身是"百分比变化"，
+                       天然无量纲，100元涨1%和5元涨1%结果相同。
+                       注意：只对价格序列（PCF）有经济意义，
+                       对 VCF/ACF/TRCF 不建议使用。
     """
     if mode is None:
         mode = DISPERSION_MODE
 
-    mas = pd.DataFrame({
-        f'ma{p}': series.rolling(p, min_periods=p).mean()
-        for p in periods
-    })
+    if mode == 'log_return':
+        # 先把原始序列转为对数收益率，再在收益率序列上算均线和 std
+        # +1e-8 防止 series 中出现 0 或负值时 log 报错
+        log_ret = np.log(series / series.shift(1) + 1e-8)
+        mas = pd.DataFrame({
+            f'ma{p}': log_ret.rolling(p, min_periods=p).mean()
+            for p in periods
+        })
+    else:
+        mas = pd.DataFrame({
+            f'ma{p}': series.rolling(p, min_periods=p).mean()
+            for p in periods
+        })
 
     if mode == 'relative':
         dispersion = mas.std(axis=1) / (mas.mean(axis=1) + 1e-8)
     else:
+        # 'absolute' 和 'log_return' 都直接用 std
         dispersion = mas.std(axis=1)
 
     return -np.log(1 + dispersion)
@@ -472,16 +478,34 @@ def calc_convergence_factor(series: pd.Series,
 
 
 
-def calc_all_factors(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    计算单只股票的 PCF / VCF / ACF / TRCF。
-    PVCF 需要全市场截面数据，不在此处计算，在面板拼合后调用 calc_pvcf()。
-    """
-    result = df.copy()
-    result['PCF']  = calc_convergence_factor(df['close'])
-    result['VCF']  = calc_convergence_factor(df['volume'])
-    result['ACF']  = calc_convergence_factor(df['amount'])
-    result['TRCF'] = calc_convergence_factor(df['turnover'])
+# def calc_all_factors(df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     计算单只股票的 PCF / VCF / ACF / TRCF。
+#     PVCF 需要全市场截面数据，不在此处计算，在面板拼合后调用 calc_pvcf()。
+#     """
+#     result = df.copy()
+#     result['PCF']  = calc_convergence_factor(df['close'])
+#     result['VCF']  = calc_convergence_factor(df['volume'])
+#     result['ACF']  = calc_convergence_factor(df['amount'])
+#     result['TRCF'] = calc_convergence_factor(df['turnover'])
+#     return result
+
+def calc_all_factors(df):
+    result = df[['date', 'symbol']].copy()
+    
+    result['PCF'] = df.groupby('symbol')['close'].transform(
+        lambda s: calc_convergence_factor(s, mode='log_return')  # PCF 用对数收益率
+    )
+    result['VCF'] = df.groupby('symbol')['volume'].transform(
+        lambda s: calc_convergence_factor(s, mode='relative')    # CV
+    )
+    result['ACF'] = df.groupby('symbol')['amount'].transform(
+        lambda s: calc_convergence_factor(s, mode='relative')    # CV
+    )
+    result['TRCF'] = df.groupby('symbol')['turnover'].transform(
+        lambda s: calc_convergence_factor(s, mode='relative')    # CV
+    )
+    
     return result
 
 
